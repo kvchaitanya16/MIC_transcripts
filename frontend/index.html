@@ -1,25 +1,126 @@
 <!doctype html>
-<html>
+<html data-theme="light">
   <head>
     <meta charset="utf-8" />
-    <title>Live Transcribe (Dumb UI)</title>
+    <title>Live Transcription (Dumb UI)</title>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <style>
-      body { font-family: system-ui, sans-serif; margin: 2rem; }
-      button { padding: 0.75rem 1rem; font-size: 1rem; cursor: pointer; }
-      #text { width: 100%; height: 220px; margin-top: 1rem; font-size: 1rem; }
-      .status { margin-left: 0.75rem; font-size: 0.9rem; opacity: 0.8; }
+      :root {
+        --bg: #ffffff;
+        --fg: #0f172a;          /* slate-900 */
+        --muted: #64748b;       /* slate-500 */
+        --card: #f8fafc;        /* slate-50 */
+        --border: #e2e8f0;      /* slate-200 */
+        --btn-bg: #111827;      /* gray-900 */
+        --btn-fg: #ffffff;
+        --btn-bg-hover: #000000;
+        --input-bg: #ffffff;
+      }
+      [data-theme="dark"] {
+        --bg: #0b1020;
+        --fg: #e5e7eb;          /* slate-200 */
+        --muted: #9ca3af;       /* gray-400 */
+        --card: #111827;        /* gray-900 */
+        --border: #1f2937;      /* gray-800 */
+        --btn-bg: #2563eb;      /* blue-600 */
+        --btn-fg: #ffffff;
+        --btn-bg-hover: #1d4ed8;
+        --input-bg: #0f172a;    /* slate-900 */
+      }
+
+      * { box-sizing: border-box; }
+      body {
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, Inter, sans-serif;
+        margin: 2rem;
+        background: var(--bg);
+        color: var(--fg);
+        transition: background 0.2s ease, color 0.2s ease;
+      }
+      .row {
+        display: flex;
+        gap: 0.75rem;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+      button {
+        padding: 0.7rem 1rem;
+        font-size: 1rem;
+        cursor: pointer;
+        border-radius: 0.6rem;
+        border: 1px solid var(--border);
+        background: var(--btn-bg);
+        color: var(--btn-fg);
+        transition: background 0.15s ease, transform 0.02s ease;
+      }
+      button:hover { background: var(--btn-bg-hover); }
+      button:active { transform: translateY(1px); }
+      #text {
+        width: 100%;
+        height: 240px;
+        margin-top: 1rem;
+        font-size: 1rem;
+        padding: 0.75rem;
+        border-radius: 0.6rem;
+        border: 1px solid var(--border);
+        background: var(--input-bg);
+        color: var(--fg);
+      }
+      .status {
+        margin-left: 0.25rem;
+        font-size: 0.95rem;
+        color: var(--muted);
+      }
+      hr {
+        border: none;
+        border-top: 1px solid var(--border);
+        margin: 1.25rem 0;
+      }
     </style>
   </head>
   <body>
-    <h1>Live Transcription (Frontend is “dumb”)</h1>
+    <h1>Live Transcription</h1>
 
-    <button id="micBtn">🎙️ Start</button>
-    <span class="status" id="status">Idle</span>
+    <div class="row">
+      <button id="micBtn">🎙️ Start</button>
+      <span class="status" id="status">Idle</span>
+      <span style="flex:1"></span>
+      <button id="themeToggle" title="Toggle dark mode">🌙 Dark</button>
+    </div>
+
+    <hr />
 
     <textarea id="text" placeholder="Live transcript appears here..." readonly></textarea>
 
     <script>
+      // ---- Theme setup ----
+      const THEME_KEY = "transcripto-theme";
+      const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+      const savedTheme = localStorage.getItem(THEME_KEY);
+      const initialTheme = savedTheme || (prefersDark ? "dark" : "light");
+      const root = document.documentElement;
+      const themeToggle = document.getElementById("themeToggle");
+
+      function applyTheme(mode) {
+        root.setAttribute("data-theme", mode);
+        themeToggle.textContent = mode === "dark" ? "☀️ Light" : "🌙 Dark";
+        themeToggle.setAttribute("aria-pressed", mode === "dark" ? "true" : "false");
+      }
+      applyTheme(initialTheme);
+
+      themeToggle.addEventListener("click", () => {
+        const next = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
+        applyTheme(next);
+        localStorage.setItem(THEME_KEY, next);
+      });
+
+      // Update on OS theme change if user never manually picked
+      if (!savedTheme && window.matchMedia) {
+        window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
+          applyTheme(e.matches ? "dark" : "light");
+        });
+      }
+
+      // ---- Transcription client ----
       const micBtn = document.getElementById("micBtn");
       const statusEl = document.getElementById("status");
       const textArea = document.getElementById("text");
@@ -29,7 +130,6 @@
       let recording = false;
 
       async function start() {
-        // WebSocket to your backend
         ws = new WebSocket("ws://localhost:8000/ws/transcribe");
         ws.binaryType = "arraybuffer";
 
@@ -43,19 +143,16 @@
             if (msg.type === "ready") {
               statusEl.textContent = "Ready. Starting mic…";
               startMedia();
-            } else if (msg.type === "ack") {
-              // optional: ack of audio chunk
-            } else if (msg.type === "partial") {
+            } else if (msg.type === "partial" || msg.type === "final") {
               textArea.value = msg.text;
-            } else if (msg.type === "final") {
-              textArea.value = msg.text;
+              textArea.scrollTop = textArea.scrollHeight;
             } else if (msg.type === "warning") {
               console.warn(msg.message);
             } else if (msg.type === "error") {
               console.error(msg.message);
             }
-          } catch (e) {
-            // not JSON? ignore
+          } catch {
+            // ignore non-JSON
           }
         };
 
@@ -67,13 +164,17 @@
       async function startMedia() {
         try {
           const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-          mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
+
+          // Tip: explicit codec helps across browsers
+          const type = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+            ? "audio/webm;codecs=opus"
+            : "audio/webm";
+
+          mediaRecorder = new MediaRecorder(stream, { mimeType: type });
 
           mediaRecorder.addEventListener("dataavailable", (e) => {
             if (e.data && e.data.size > 0 && ws && ws.readyState === WebSocket.OPEN) {
-              e.data.arrayBuffer().then((buf) => {
-                ws.send(buf);
-              });
+              e.data.arrayBuffer().then((buf) => ws.send(buf));
             }
           });
 
@@ -87,13 +188,11 @@
             statusEl.textContent = "Stopped";
             micBtn.textContent = "🎙️ Start";
             recording = false;
-            if (ws && ws.readyState === WebSocket.OPEN) {
-              ws.close();
-            }
+            if (ws && ws.readyState === WebSocket.OPEN) ws.close();
           });
 
-          // emit small chunks frequently so backend can transcribe often
-          mediaRecorder.start(500); // 500ms chunks
+          // Emit chunks frequently so backend can transcribe often
+          mediaRecorder.start(800); // ~0.8s per chunk is a sweet spot
         } catch (err) {
           statusEl.textContent = "Mic error";
           console.error(err);
@@ -105,9 +204,7 @@
           textArea.value = "";
           await start();
         } else {
-          if (mediaRecorder && mediaRecorder.state !== "inactive") {
-            mediaRecorder.stop();
-          }
+          if (mediaRecorder && mediaRecorder.state !== "inactive") mediaRecorder.stop();
         }
       });
     </script>
