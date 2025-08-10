@@ -1,0 +1,115 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Live Transcribe (Dumb UI)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 2rem; }
+      button { padding: 0.75rem 1rem; font-size: 1rem; cursor: pointer; }
+      #text { width: 100%; height: 220px; margin-top: 1rem; font-size: 1rem; }
+      .status { margin-left: 0.75rem; font-size: 0.9rem; opacity: 0.8; }
+    </style>
+  </head>
+  <body>
+    <h1>Live Transcription (Frontend is “dumb”)</h1>
+
+    <button id="micBtn">🎙️ Start</button>
+    <span class="status" id="status">Idle</span>
+
+    <textarea id="text" placeholder="Live transcript appears here..." readonly></textarea>
+
+    <script>
+      const micBtn = document.getElementById("micBtn");
+      const statusEl = document.getElementById("status");
+      const textArea = document.getElementById("text");
+
+      let mediaRecorder = null;
+      let ws = null;
+      let recording = false;
+
+      async function start() {
+        // WebSocket to your backend
+        ws = new WebSocket("ws://localhost:8000/ws/transcribe");
+        ws.binaryType = "arraybuffer";
+
+        ws.onopen = () => {
+          statusEl.textContent = "WebSocket connected, awaiting mic…";
+        };
+
+        ws.onmessage = (ev) => {
+          try {
+            const msg = JSON.parse(ev.data);
+            if (msg.type === "ready") {
+              statusEl.textContent = "Ready. Starting mic…";
+              startMedia();
+            } else if (msg.type === "ack") {
+              // optional: ack of audio chunk
+            } else if (msg.type === "partial") {
+              textArea.value = msg.text;
+            } else if (msg.type === "final") {
+              textArea.value = msg.text;
+            } else if (msg.type === "warning") {
+              console.warn(msg.message);
+            } else if (msg.type === "error") {
+              console.error(msg.message);
+            }
+          } catch (e) {
+            // not JSON? ignore
+          }
+        };
+
+        ws.onclose = () => {
+          statusEl.textContent = "WebSocket closed";
+        };
+      }
+
+      async function startMedia() {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
+
+          mediaRecorder.addEventListener("dataavailable", (e) => {
+            if (e.data && e.data.size > 0 && ws && ws.readyState === WebSocket.OPEN) {
+              e.data.arrayBuffer().then((buf) => {
+                ws.send(buf);
+              });
+            }
+          });
+
+          mediaRecorder.addEventListener("start", () => {
+            statusEl.textContent = "Recording…";
+            micBtn.textContent = "⏹ Stop";
+            recording = true;
+          });
+
+          mediaRecorder.addEventListener("stop", () => {
+            statusEl.textContent = "Stopped";
+            micBtn.textContent = "🎙️ Start";
+            recording = false;
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.close();
+            }
+          });
+
+          // emit small chunks frequently so backend can transcribe often
+          mediaRecorder.start(500); // 500ms chunks
+        } catch (err) {
+          statusEl.textContent = "Mic error";
+          console.error(err);
+        }
+      }
+
+      micBtn.addEventListener("click", async () => {
+        if (!recording) {
+          textArea.value = "";
+          await start();
+        } else {
+          if (mediaRecorder && mediaRecorder.state !== "inactive") {
+            mediaRecorder.stop();
+          }
+        }
+      });
+    </script>
+  </body>
+</html>
