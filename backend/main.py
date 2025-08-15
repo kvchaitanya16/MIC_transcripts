@@ -5,10 +5,11 @@ import wave
 import math
 import difflib
 import asyncio
-import tempfile
 import subprocess
 import logging
 import array
+import tempfile
+import json
 from typing import Dict, Optional, Tuple, Any, List
 from contextlib import suppress as contextlib_suppress
 
@@ -27,39 +28,44 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 
 # ------------------ Config ------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-TRANSCRIBE_MODEL = os.getenv("TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")  # or "whisper-1"
+# For best accuracy, whisper-1; for lower latency, gpt-4o-mini-transcribe
+TRANSCRIBE_MODEL = os.getenv("TRANSCRIBE_MODEL", "whisper-1")
 STT_RESPONSE_FORMAT = os.getenv("STT_RESPONSE_FORMAT", "json").lower()      # "json" | "verbose_json"
 PARTIAL_INTERVAL_SEC = float(os.getenv("PARTIAL_INTERVAL_SEC", "0.6"))
 
-# PCM settings
+# PCM settings (decoded target)
 PCM_SAMPLE_RATE = int(os.getenv("PCM_SAMPLE_RATE", "16000"))
 PCM_CHANNELS = 1
 PCM_SAMPWIDTH = 2  # 16-bit
 
-# batching
-MIN_BATCH_SEC   = float(os.getenv("MIN_BATCH_SEC", "1.2"))   # wait for >= 1.2s of NEW PCM
+# Segmentation by silence + forced cut
+SILENCE_HANG_SEC = float(os.getenv("SILENCE_HANG_SEC", "0.5"))   # finalize when >= this silence after speech
+MIN_SEG_SEC      = float(os.getenv("MIN_SEG_SEC", "1.8"))        # min speech length to send to STT
+MAX_SEG_SEC      = float(os.getenv("MAX_SEG_SEC", "6.0"))        # force flush even if no pause
+
+# Safety overlap and memory bounds
 OVERLAP_SEC     = float(os.getenv("OVERLAP_SEC", "0.25"))
-MAX_BATCH_SEC   = float(os.getenv("MAX_BATCH_SEC", "5.0"))
 MAX_BUFFER_SEC  = float(os.getenv("MAX_BUFFER_SEC", "120"))
 
 # VAD / Silence gate
-AUDIO_LANGUAGE  = os.getenv("AUDIO_LANGUAGE", "auto")        # "auto" | "en" | "te" | etc.
-MIN_RMS_ABS     = float(os.getenv("MIN_RMS_ABS", "250"))     # absolute floor for RMS
-NOISE_FACTOR    = float(os.getenv("NOISE_FACTOR", "3.0"))    # threshold = max(MIN_RMS_ABS, noise_floor * NOISE_FACTOR)
-NOISE_WINSIZE   = int(os.getenv("NOISE_WINSIZE", "12"))      # how many low-RMS windows to learn baseline
+AUDIO_LANGUAGE  = os.getenv("AUDIO_LANGUAGE", "auto")            # "auto" | "en" | "te" | etc.
+MIN_RMS_ABS     = float(os.getenv("MIN_RMS_ABS", "350"))         # absolute floor
+NOISE_FACTOR    = float(os.getenv("NOISE_FACTOR", "4.0"))        # threshold = max(MIN_RMS_ABS, noise_floor * NOISE_FACTOR)
+NOISE_WINSIZE   = int(os.getenv("NOISE_WINSIZE", "12"))          # how many low-RMS windows to learn baseline
 CLEAR_DRAFT_ON_SILENCE = os.getenv("CLEAR_DRAFT_ON_SILENCE", "1") == "1"
 
 # Derived
-BYTES_PER_SEC    = PCM_SAMPLE_RATE * PCM_CHANNELS * PCM_SAMPWIDTH
-MIN_BATCH_BYTES  = int(MIN_BATCH_SEC * BYTES_PER_SEC)
-OVERLAP_BYTES    = int(OVERLAP_SEC * BYTES_PER_SEC)
-MAX_BATCH_BYTES  = int(MAX_BATCH_SEC * BYTES_PER_SEC)
-MAX_BUFFER_BYTES = int(MAX_BUFFER_SEC * BYTES_PER_SEC)
+BYTES_PER_SEC      = PCM_SAMPLE_RATE * PCM_CHANNELS * PCM_SAMPWIDTH
+SILENCE_HANG_BYTES = int(SILENCE_HANG_SEC * BYTES_PER_SEC)
+MIN_SEG_BYTES      = int(MIN_SEG_SEC * BYTES_PER_SEC)
+MAX_SEG_BYTES      = int(MAX_SEG_SEC * BYTES_PER_SEC)
+OVERLAP_BYTES      = int(OVERLAP_SEC * BYTES_PER_SEC)
+MAX_BUFFER_BYTES   = int(MAX_BUFFER_SEC * BYTES_PER_SEC)
 
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten for prod
+    allow_origins=["*"],   # tighten for prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -104,9 +110,8 @@ def compute_rms_s16le(pcm_bytes: bytes) -> float:
         return 0.0
     arr = array.array("h")  # signed short
     arr.frombytes(pcm_bytes)
-    if len(arr) == 0:
+    if not arr:
         return 0.0
-    # avoid overflow: use float accumulation
     s = 0.0
     for v in arr:
         s += float(v) * float(v)
@@ -131,6 +136,10 @@ class SessionState:
         self.seen_norm_sentences: set[str] = set()
         self.last_confirmed_norm: str = ""
 
+        # Answers store / session control
+        self.answers: List[str] = []
+        self.end_requested: bool = False
+
         # VAD state
         self.noise_samples: List[float] = []  # low-RMS windows to estimate noise floor
         self.noise_floor: Optional[float] = None
@@ -145,6 +154,13 @@ class SessionState:
             return (self.confirmed_text + (" " if need_space else "") + self.draft_text).strip()
         return self.confirmed_text
 
+def reset_transcript_state(state: "SessionState"):
+    """Clear current transcript so the next speech becomes the next answer."""
+    state.confirmed_text = ""
+    state.draft_text = ""
+    state.seen_norm_sentences.clear()
+    state.last_confirmed_norm = ""
+
 # in-memory sessions
 sessions: Dict[WebSocket, SessionState] = {}
 
@@ -157,11 +173,6 @@ async def safe_send_json(ws: WebSocket, payload: dict):
 
 # ------------------ ffmpeg: persistent transcode ------------------
 async def start_ffmpeg(state: SessionState):
-    """
-    Launch one ffmpeg per websocket.
-    We stream media chunks to stdin, and read decoded PCM from stdout.
-    Let ffmpeg auto-detect the container (webm/ogg/mp4).
-    """
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg",
@@ -228,7 +239,6 @@ def transcribe_wav_bytes(wav_bytes: bytes, fmt: str) -> Any:
         tmp.write(wav_bytes)
         tmp.flush()
         params = dict(model=TRANSCRIBE_MODEL, file=open(tmp.name, "rb"), response_format=fmt, temperature=0)
-        # Optional language lock
         if AUDIO_LANGUAGE and AUDIO_LANGUAGE.lower() != "auto":
             params["language"] = AUDIO_LANGUAGE
         try:
@@ -260,7 +270,7 @@ def merge_json_text(state: SessionState, full_text: str) -> bool:
         state.last_confirmed_norm = norm
         changed = True
 
-    # update draft
+    # update draft (tail)
     if draft:
         if is_similar(draft, state.draft_text, thr=0.90):
             if len(draft) > len(state.draft_text):
@@ -292,79 +302,98 @@ def merge_response_into_state(state: SessionState, resp: Any, fmt: str) -> bool:
             return False
         return merge_json_text(state, txt)
 
-# ------------------ Partial loop (with VAD) ------------------
+# ------------------ Partial loop: silence + forced cut ------------------
 async def run_partial_loop(ws: WebSocket, state: SessionState):
+    in_speech = False
+    seg_start = 0
+    last_voiced_end = 0
+
     try:
         while not state.closed and ws.application_state == WebSocketState.CONNECTED:
             await asyncio.sleep(PARTIAL_INTERVAL_SEC)
 
+            # Work with the *new* PCM window since last processed index
             async with state.pcm_lock:
                 total = len(state.pcm)
-                new_bytes = total - state.processed_bytes
-                if new_bytes < MIN_BATCH_BYTES:
+                if total <= state.processed_bytes:
                     continue
+                window = bytes(state.pcm[state.processed_bytes:total])
 
-                start = max(0, state.processed_bytes - OVERLAP_BYTES)
-                end = min(total, state.processed_bytes + min(new_bytes, MAX_BATCH_BYTES))
-                slice_pcm = bytes(state.pcm[start:end])
+            # VAD on the window to detect speech / silence
+            rms = compute_rms_s16le(window)
 
-            # ---- VAD: skip silence/low energy ----
-            rms = compute_rms_s16le(slice_pcm)
-
-            # learn noise floor (use only low-energy slices)
-            if (state.noise_floor is None or rms <= (state.noise_floor * NOISE_FACTOR)):
+            # Learn noise floor (use only low-energy windows)
+            if (state.noise_floor is None) or (rms <= (state.noise_floor * NOISE_FACTOR)):
                 if len(state.noise_samples) < NOISE_WINSIZE:
                     state.noise_samples.append(rms)
-                    # robust baseline: median of collected samples
                     sorted_ns = sorted(state.noise_samples)
                     state.noise_floor = sorted_ns[len(sorted_ns)//2] if sorted_ns else rms
 
-            threshold = max(MIN_RMS_ABS, (state.noise_floor or 0.0) * NOISE_FACTOR)
+            thr = max(MIN_RMS_ABS, (state.noise_floor or 0.0) * NOISE_FACTOR)
 
-            if rms < threshold:
-                # Treat as silence → advance pointer but don't call STT
-                if CLEAR_DRAFT_ON_SILENCE and state.draft_text:
-                    state.draft_text = ""  # clear dangling draft during silence
-                    await safe_send_json(ws, {"type": "partial", "text": state.cum_text})
+            if rms >= thr:
+                # We are in speech now
+                if not in_speech:
+                    in_speech = True
+                    seg_start = state.processed_bytes
+                last_voiced_end = total
+
+            # compute current segment length if in_speech
+            cur_seg_len = (total - seg_start) if in_speech else 0
+            trailing_silence = total - max(last_voiced_end, state.processed_bytes)
+
+            # finalize if: (a) we have enough trailing silence, OR (b) segment grew too long
+            should_finalize = False
+            use_end = None
+            if in_speech and trailing_silence >= SILENCE_HANG_BYTES:
+                should_finalize = True
+                use_end = last_voiced_end
+            elif in_speech and cur_seg_len >= MAX_SEG_BYTES:
+                should_finalize = True
+                use_end = total  # hard cut; overlap will smooth boundary
+
+            if should_finalize and use_end is not None:
+                seg_end = use_end
+                seg_bytes = seg_end - seg_start
+                if seg_bytes >= MIN_SEG_BYTES:
+                    # Transcribe the full speech segment [seg_start:seg_end]
+                    async with state.pcm_lock:
+                        slice_pcm = bytes(state.pcm[seg_start:seg_end])
+
+                    with io.BytesIO() as wav_io:
+                        with wave.open(wav_io, "wb") as wf:
+                            wf.setnchannels(PCM_CHANNELS)
+                            wf.setsampwidth(PCM_SAMPWIDTH)
+                            wf.setframerate(PCM_SAMPLE_RATE)
+                            wf.writeframes(slice_pcm)
+                        wav_bytes = wav_io.getvalue()
+
+                    try:
+                        resp = transcribe_wav_bytes(wav_bytes, STT_RESPONSE_FORMAT)
+                        if merge_response_into_state(state, resp, STT_RESPONSE_FORMAT):
+                            await safe_send_json(ws, {"type": "partial", "text": state.cum_text})
+                    except Exception as e:
+                        logging.error("Transcribe failed: %s", e)
+                        await safe_send_json(ws, {"type": "warning", "message": f"Transcribe failed: {e}"})
+
+                # Move processed pointer up, keep small overlap
                 async with state.pcm_lock:
-                    state.processed_bytes = end - OVERLAP_BYTES
-                    if state.processed_bytes < 0:
-                        state.processed_bytes = 0
-                    if state.processed_bytes > MAX_BUFFER_BYTES:
-                        drop = state.processed_bytes - MAX_BUFFER_BYTES
-                        state.pcm = bytearray(state.pcm[drop:])
-                        state.processed_bytes -= drop
-                logging.debug(f"Silence gated (RMS={rms:.1f}, thr={threshold:.1f})")
-                continue
+                    state.processed_bytes = max(seg_start, seg_end - OVERLAP_BYTES)
+                in_speech = False
 
-            # ---- Transcribe speech slice ----
-            with io.BytesIO() as wav_io:
-                with wave.open(wav_io, "wb") as wf:
-                    wf.setnchannels(PCM_CHANNELS)
-                    wf.setsampwidth(PCM_SAMPWIDTH)
-                    wf.setframerate(PCM_SAMPLE_RATE)
-                    wf.writeframes(slice_pcm)
-                wav_bytes = wav_io.getvalue()
-
-            try:
-                resp = transcribe_wav_bytes(wav_bytes, STT_RESPONSE_FORMAT)
-                if merge_response_into_state(state, resp, STT_RESPONSE_FORMAT):
-                    await safe_send_json(ws, {"type": "partial", "text": state.cum_text})
-            except Exception as e:
-                logging.error("Transcribe failed: %s", e)
-                await safe_send_json(ws, {"type": "warning", "message": f"Transcribe failed: {e}"})
-
-            # advance pointer & bound memory
+            # Bound memory
             async with state.pcm_lock:
-                state.processed_bytes = end - OVERLAP_BYTES
-                if state.processed_bytes < 0:
-                    state.processed_bytes = 0
                 if state.processed_bytes > MAX_BUFFER_BYTES:
                     drop = state.processed_bytes - MAX_BUFFER_BYTES
                     state.pcm = bytearray(state.pcm[drop:])
+                    seg_start = max(0, seg_start - drop)
+                    last_voiced_end = max(0, last_voiced_end - drop)
                     state.processed_bytes -= drop
-                logging.info("PCM total=%dB processed=%dB new=%dB (RMS=%.1f thr=%.1f)",
-                             len(state.pcm), state.processed_bytes, len(state.pcm) - state.processed_bytes, rms, threshold)
+
+            logging.info(
+                "PCM total=%dB processed=%dB in_speech=%s thr=%.1f rms=%.1f",
+                len(state.pcm), state.processed_bytes, in_speech, thr, rms
+            )
 
     except asyncio.CancelledError:
         pass
@@ -384,12 +413,44 @@ async def ws_transcribe(ws: WebSocket):
     try:
         while True:
             msg = await ws.receive()
+
+            # Client closed
             if "type" in msg and msg["type"] == "websocket.disconnect":
                 break
 
+            # Text message: handle JSON commands (submit/end)
             if msg.get("text") is not None:
+                try:
+                    data = json.loads(msg["text"])
+                except Exception:
+                    await safe_send_json(ws, {"type": "warning", "message": "Invalid JSON command"})
+                    continue
+
+                cmd = (data or {}).get("type")
+                if cmd == "submit":
+                    saved = (state.cum_text or "").strip()
+                    if saved:
+                        state.answers.append(saved)
+                        await safe_send_json(ws, {"type": "submitted", "index": len(state.answers), "text": saved})
+                    else:
+                        await safe_send_json(ws, {"type": "submitted", "index": len(state.answers) + 1, "text": ""})
+                    reset_transcript_state(state)
+                    await safe_send_json(ws, {"type": "clear_current"})
+                    continue
+
+                elif cmd == "end":
+                    state.end_requested = True
+                    tail = (state.cum_text or "").strip()
+                    if tail:
+                        state.answers.append(tail)
+                        await safe_send_json(ws, {"type": "submitted", "index": len(state.answers), "text": tail})
+                    break
+
+                else:
+                    await safe_send_json(ws, {"type": "warning", "message": f"Unknown command: {cmd}"})
                 continue
 
+            # Binary audio
             data = msg.get("bytes")
             if data:
                 try:
@@ -416,30 +477,35 @@ async def ws_transcribe(ws: WebSocket):
             with contextlib_suppress(asyncio.CancelledError):
                 await state.transcribe_task
 
-        # final pass on any remaining PCM (if not silence)
+        # Finalize
         try:
-            async with state.pcm_lock:
-                total = len(state.pcm)
-                new_bytes = total - state.processed_bytes
-                if new_bytes > 0 and ws.application_state == WebSocketState.CONNECTED:
-                    start = max(0, state.processed_bytes - OVERLAP_BYTES)
-                    end = total
-                    slice_pcm = bytes(state.pcm[start:end])
+            if not state.end_requested:
+                # Usual final flush for live session stop (e.g., mic stop)
+                async with state.pcm_lock:
+                    total = len(state.pcm)
+                    new_bytes = total - state.processed_bytes
+                    seg_start = state.processed_bytes
+                    seg_end = total
 
-            if new_bytes > 0 and ws.application_state == WebSocketState.CONNECTED:
-                rms = compute_rms_s16le(slice_pcm)
-                thr = max(MIN_RMS_ABS, (state.noise_floor or 0.0) * NOISE_FACTOR)
-                if rms >= thr:
-                    with io.BytesIO() as wav_io:
-                        with wave.open(wav_io, "wb") as wf:
-                            wf.setnchannels(PCM_CHANNELS)
-                            wf.setsampwidth(PCM_SAMPWIDTH)
-                            wf.setframerate(PCM_SAMPLE_RATE)
-                            wf.writeframes(slice_pcm)
-                        wav_bytes = wav_io.getvalue()
-                    resp = transcribe_wav_bytes(wav_bytes, STT_RESPONSE_FORMAT)
-                    merge_response_into_state(state, resp, STT_RESPONSE_FORMAT)
+                if new_bytes > 0 and ws.application_state == WebSocketState.CONNECTED:
+                    slice_pcm = bytes(state.pcm[seg_start:seg_end])
+                    rms = compute_rms_s16le(slice_pcm)
+                    thr = max(MIN_RMS_ABS, (state.noise_floor or 0.0) * NOISE_FACTOR)
+                    if rms >= thr and (seg_end - seg_start) >= max(MIN_SEG_BYTES, BYTES_PER_SEC):
+                        with io.BytesIO() as wav_io:
+                            with wave.open(wav_io, "wb") as wf:
+                                wf.setnchannels(PCM_CHANNELS)
+                                wf.setsampwidth(PCM_SAMPWIDTH)
+                                wf.setframerate(PCM_SAMPLE_RATE)
+                                wf.writeframes(slice_pcm)
+                            wav_bytes = wav_io.getvalue()
+                        resp = transcribe_wav_bytes(wav_bytes, STT_RESPONSE_FORMAT)
+                        merge_response_into_state(state, resp, STT_RESPONSE_FORMAT)
+
                 await safe_send_json(ws, {"type": "final", "text": state.cum_text})
+            else:
+                # User requested End: send the collected answers summary
+                await safe_send_json(ws, {"type": "session_end", "answers": state.answers})
         except Exception as e:
             logging.error("Final transcribe failed: %s", e)
 

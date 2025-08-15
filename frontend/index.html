@@ -2,7 +2,7 @@
 <html data-theme="light">
   <head>
     <meta charset="utf-8" />
-    <title>Live Transcription (Dumb UI)</title>
+    <title>Live Transcription</title>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <style>
       :root {
@@ -15,6 +15,7 @@
         --btn-fg: #ffffff;
         --btn-bg-hover: #000000;
         --input-bg: #ffffff;
+        --accent: #2563eb;      /* blue-600 */
       }
       [data-theme="dark"] {
         --bg: #0b1020;
@@ -26,6 +27,7 @@
         --btn-fg: #ffffff;
         --btn-bg-hover: #1d4ed8;
         --input-bg: #0f172a;    /* slate-900 */
+        --accent: #60a5fa;      /* blue-400 */
       }
 
       * { box-sizing: border-box; }
@@ -36,6 +38,7 @@
         color: var(--fg);
         transition: background 0.2s ease, color 0.2s ease;
       }
+      h1 { margin-bottom: 0.75rem; }
       .row {
         display: flex;
         gap: 0.75rem;
@@ -50,10 +53,18 @@
         border: 1px solid var(--border);
         background: var(--btn-bg);
         color: var(--btn-fg);
-        transition: background 0.15s ease, transform 0.02s ease;
+        transition: background 0.15s ease, transform 0.02s ease, opacity 0.2s ease;
       }
       button:hover { background: var(--btn-bg-hover); }
       button:active { transform: translateY(1px); }
+      button[disabled] { opacity: 0.6; cursor: not-allowed; }
+      .secondary {
+        background: transparent;
+        color: var(--fg);
+      }
+      .secondary:hover {
+        background: var(--card);
+      }
       #text {
         width: 100%;
         height: 240px;
@@ -75,6 +86,55 @@
         border-top: 1px solid var(--border);
         margin: 1.25rem 0;
       }
+
+      /* Answers section */
+      .answers-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        gap: 1rem;
+        margin: 1rem 0 0.5rem;
+      }
+      .answers-grid {
+        display: grid;
+        grid-template-columns: repeat( auto-fill, minmax(260px, 1fr) );
+        gap: 0.9rem;
+      }
+      .card {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 0.75rem;
+        padding: 0.9rem;
+        display: flex;
+        flex-direction: column;
+        gap: 0.6rem;
+        min-height: 140px;
+      }
+      .card h3 {
+        margin: 0;
+        font-size: 1rem;
+        color: var(--accent);
+      }
+      .card pre {
+        margin: 0;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+        white-space: pre-wrap;
+        word-wrap: break-word;
+        font-size: 0.95rem;
+        color: var(--fg);
+      }
+      .card .actions {
+        display: flex;
+        gap: 0.5rem;
+        margin-top: auto;
+      }
+      .pill {
+        font-size: 0.8rem;
+        padding: 0.25rem 0.5rem;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        color: var(--muted);
+      }
     </style>
   </head>
   <body>
@@ -82,6 +142,8 @@
 
     <div class="row">
       <button id="micBtn">🎙️ Start</button>
+      <button id="submitBtn" class="secondary" disabled>✅ Submit Answer</button>
+      <button id="endBtn" class="secondary" disabled>🛑 End Session</button>
       <span class="status" id="status">Idle</span>
       <span style="flex:1"></span>
       <button id="themeToggle" title="Toggle dark mode">🌙 Dark</button>
@@ -90,6 +152,12 @@
     <hr />
 
     <textarea id="text" placeholder="Live transcript appears here..." readonly></textarea>
+
+    <div class="answers-header">
+      <h2>Your Answers</h2>
+      <span class="pill"><span id="answerCount">0</span> saved</span>
+    </div>
+    <div id="answers" class="answers-grid"></div>
 
     <script>
       // ---- Theme setup ----
@@ -113,22 +181,79 @@
         localStorage.setItem(THEME_KEY, next);
       });
 
-      // Update on OS theme change if user never manually picked
       if (!savedTheme && window.matchMedia) {
         window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
           applyTheme(e.matches ? "dark" : "light");
         });
       }
 
-      // ---- Transcription client ----
+      // ---- Elements ----
       const micBtn = document.getElementById("micBtn");
+      const submitBtn = document.getElementById("submitBtn");
+      const endBtn = document.getElementById("endBtn");
       const statusEl = document.getElementById("status");
       const textArea = document.getElementById("text");
+      const answersWrap = document.getElementById("answers");
+      const answerCountEl = document.getElementById("answerCount");
 
+      // ---- State ----
       let mediaRecorder = null;
       let ws = null;
       let recording = false;
+      let answers = [];
 
+      // ---- Helpers ----
+      function enableSessionControls(enabled) {
+        submitBtn.disabled = !enabled;
+        endBtn.disabled = !enabled;
+      }
+
+      function createAnswerCard(index, text) {
+        const card = document.createElement("div");
+        card.className = "card";
+
+        const title = document.createElement("h3");
+        title.textContent = `Answer ${index}`;
+
+        const pre = document.createElement("pre");
+        pre.textContent = text || "(empty)";
+
+        const actions = document.createElement("div");
+        actions.className = "actions";
+
+        const copyBtn = document.createElement("button");
+        copyBtn.className = "secondary";
+        copyBtn.textContent = "📋 Copy";
+        copyBtn.addEventListener("click", async () => {
+          try {
+            await navigator.clipboard.writeText(text);
+            copyBtn.textContent = "✅ Copied";
+            setTimeout(() => (copyBtn.textContent = "📋 Copy"), 1200);
+          } catch {
+            // ignore
+          }
+        });
+
+        actions.appendChild(copyBtn);
+        card.appendChild(title);
+        card.appendChild(pre);
+        card.appendChild(actions);
+        return card;
+      }
+
+      function addAnswer(text) {
+        answers.push(text);
+        const idx = answers.length;
+        answersWrap.appendChild(createAnswerCard(idx, text));
+        answerCountEl.textContent = String(answers.length);
+      }
+
+      function clearLiveArea() {
+        textArea.value = "";
+        textArea.scrollTop = 0;
+      }
+
+      // ---- WebSocket + Media ----
       async function start() {
         ws = new WebSocket("ws://localhost:8000/ws/transcribe");
         ws.binaryType = "arraybuffer";
@@ -140,16 +265,56 @@
         ws.onmessage = (ev) => {
           try {
             const msg = JSON.parse(ev.data);
-            if (msg.type === "ready") {
-              statusEl.textContent = "Ready. Starting mic…";
-              startMedia();
-            } else if (msg.type === "partial" || msg.type === "final") {
-              textArea.value = msg.text;
-              textArea.scrollTop = textArea.scrollHeight;
-            } else if (msg.type === "warning") {
-              console.warn(msg.message);
-            } else if (msg.type === "error") {
-              console.error(msg.message);
+
+            switch (msg.type) {
+              case "ready":
+                statusEl.textContent = "Ready. Starting mic…";
+                startMedia();
+                break;
+
+              case "partial":
+              case "final":
+                textArea.value = msg.text || "";
+                textArea.scrollTop = textArea.scrollHeight;
+                // If there is any text, enable submit
+                submitBtn.disabled = !textArea.value.trim();
+                break;
+
+              case "submitted":
+                addAnswer(msg.text || "");
+                break;
+
+              case "clear_current":
+                clearLiveArea();
+                submitBtn.disabled = true;
+                break;
+
+              case "session_end":
+                // Add any server-sent final list (in case end captured tail)
+                if (Array.isArray(msg.answers)) {
+                  answers = msg.answers.slice();
+                  answersWrap.innerHTML = "";
+                  answers.forEach((t, i) => answersWrap.appendChild(createAnswerCard(i + 1, t)));
+                  answerCountEl.textContent = String(answers.length);
+                }
+                statusEl.textContent = "Session ended";
+                enableSessionControls(false);
+                micBtn.disabled = true;
+                if (mediaRecorder && mediaRecorder.state !== "inactive") mediaRecorder.stop();
+                if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+                break;
+
+              case "ack":
+                // optional: console.debug("chunk ack", msg.bytes);
+                break;
+
+              case "warning":
+                console.warn(msg.message);
+                break;
+
+              case "error":
+                console.error(msg.message);
+                break;
             }
           } catch {
             // ignore non-JSON
@@ -158,14 +323,15 @@
 
         ws.onclose = () => {
           statusEl.textContent = "WebSocket closed";
+          enableSessionControls(false);
+          recording = false;
+          micBtn.textContent = "🎙️ Start";
         };
       }
 
       async function startMedia() {
         try {
           const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-
-          // Tip: explicit codec helps across browsers
           const type = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
             ? "audio/webm;codecs=opus"
             : "audio/webm";
@@ -182,6 +348,8 @@
             statusEl.textContent = "Recording…";
             micBtn.textContent = "⏹ Stop";
             recording = true;
+            enableSessionControls(true);
+            submitBtn.disabled = true; // until we receive some text
           });
 
           mediaRecorder.addEventListener("stop", () => {
@@ -191,21 +359,38 @@
             if (ws && ws.readyState === WebSocket.OPEN) ws.close();
           });
 
-          // Emit chunks frequently so backend can transcribe often
-          mediaRecorder.start(800); // ~0.8s per chunk is a sweet spot
+          // Emit chunks regularly so backend can transcribe often
+          mediaRecorder.start(800); // ~0.8s per chunk
         } catch (err) {
           statusEl.textContent = "Mic error";
           console.error(err);
         }
       }
 
+      // ---- UI events ----
       micBtn.addEventListener("click", async () => {
         if (!recording) {
-          textArea.value = "";
+          // reset UI state for a new session
+          clearLiveArea();
+          answers = [];
+          answersWrap.innerHTML = "";
+          answerCountEl.textContent = "0";
+          micBtn.disabled = true;
           await start();
+          micBtn.disabled = false;
         } else {
           if (mediaRecorder && mediaRecorder.state !== "inactive") mediaRecorder.stop();
         }
+      });
+
+      submitBtn.addEventListener("click", () => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        ws.send(JSON.stringify({ type: "submit" }));
+      });
+
+      endBtn.addEventListener("click", () => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        ws.send(JSON.stringify({ type: "end" }));
       });
     </script>
   </body>
